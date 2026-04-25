@@ -1,15 +1,143 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://help.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+name: Build Minimal V2Ray Rules
 
-version: 2
-updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "daily"
-      timezone: "Asia/Shanghai"
-      time: "07:00"
-    pull-request-branch-name:
-      separator: "-"
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 20 * * *"
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/build-rules.yml"
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_NAME: "rules-$(date +%Y%m%d)"
+  TAG_NAME: "v$(date +%Y%m%d)"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      # ========== GEOIP: private + ru ==========
+      - name: Build geoip.dat
+        run: |
+          git clone --depth=1 https://github.com/Loyalsoldier/geoip geoip-src
+          cd geoip-src
+          
+          cat > config.json << 'EOF'
+          {
+            "input": [
+              {
+                "type": "maxmindGeoLite2CountryCSV",
+                "action": "add",
+                "args": {
+                  "country": "https://raw.githubusercontent.com/Loyalsoldier/geoip/master/geolite2/GeoLite2-Country-Locations-en.csv",
+                  "ipv4": "https://raw.githubusercontent.com/Loyalsoldier/geoip/master/geolite2/GeoLite2-Country-Blocks-IPv4.csv",
+                  "ipv6": "https://raw.githubusercontent.com/Loyalsoldier/geoip/master/geolite2/GeoLite2-Country-Blocks-IPv6.csv",
+                  "wantedList": ["ru"]
+                }
+              },              { "type": "private", "action": "add" }
+            ],
+            "output": [
+              {
+                "type": "v2rayGeoIPDat",
+                "action": "output",
+                "args": {
+                  "outputName": "geoip.dat",
+                  "wantedList": ["private", "ru"]
+                }
+              }
+            ]
+          }
+          EOF
+          
+          go run ./ convert -c config.json
+          mkdir -p ../publish
+          cp output/dat/geoip.dat ../publish/
+          sha256sum output/dat/geoip.dat | awk '{print $1}' > ../publish/geoip.dat.sha256sum
+
+      # ========== GEOSITE: private + category-ru ==========
+      - name: Build geosite.dat
+        run: |
+          git clone --depth=1 https://github.com/Loyalsoldier/domain-list-custom dlc-src
+          mkdir -p dlc-src/data
+          
+          # private: локальные домены
+          cat > dlc-src/data/private << 'EOF'
+          full:localhost
+          regexp:.*\.local$
+          regexp:.*\.lan$
+          keyword:intranet
+          EOF
+          
+          # category-ru: автоматическая загрузка из открытого источника
+          curl -sSL "https://raw.githubusercontent.com/217heidai/geosite-generator/main/data/ru" | \
+            grep -vE '^\s*(#|$)' | \
+            sed 's/^/domain:/g' | \
+            sort -u > dlc-src/data/category-ru
+          
+          cd dlc-src
+          go run ./ --datapath=./data --outputname=geosite.dat
+          mkdir -p ../publish
+          cp publish/geosite.dat ../publish/
+          sha256sum publish/geosite.dat | awk '{print $1}' > ../publish/geosite.dat.sha256sum
+
+      # ========== ИНДЕКС ДЛЯ КЛИЕНТА ==========
+      - name: Generate index.json
+        run: |
+          cd publish          cat > index.json << EOF
+          {
+            "version": "$(date +%Y%m%d%H%M)",
+            "updated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "files": {
+              "geoip.dat": {
+                "url": "https://cdn.jsdelivr.net/gh/${{ github.repository }}@release/geoip.dat",
+                "sha256": "$(cat geoip.dat.sha256sum)"
+              },
+              "geosite.dat": {
+                "url": "https://cdn.jsdelivr.net/gh/${{ github.repository }}@release/geosite.dat",
+                "sha256": "$(cat geosite.dat.sha256sum)"
+              }
+            }
+          }
+          EOF
+
+      # ========== ПУБЛИКАЦИЯ ==========
+      - name: Upload to GitHub Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          release_name: ${{ env.RELEASE_NAME }}
+          tag: ${{ env.TAG_NAME }}
+          file_glob: true
+          file: ./publish/*
+          overwrite: true
+
+      - name: Push to release branch
+        run: |
+          cd publish
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b release || git checkout release
+          git add .
+          git commit -m "chore: update ${{ env.TAG_NAME }}" || exit 0
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git push -f -u origin release
+
+      - name: Purge jsDelivr CDN
+        run: |
+          for file in geoip.dat geosite.dat index.json; do
+            curl -s "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/${file}" > /dev/null
+          done
